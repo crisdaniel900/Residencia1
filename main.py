@@ -1,0 +1,334 @@
+import os
+import sys
+import threading
+
+import cv2
+import numpy as np
+from mediapipe.python.solutions.holistic import Holistic
+from PyQt5.QtCore import QObject, QThread, Qt, QTimer, pyqtSignal
+from PyQt5.QtGui import QImage, QPixmap
+from PyQt5.QtWidgets import (
+    QApplication, QComboBox, QFileDialog, QGroupBox, QHBoxLayout, QLabel,
+    QMainWindow, QMessageBox, QPushButton, QPlainTextEdit, QVBoxLayout,
+    QWidget, QInputDialog,
+)
+from keras.models import load_model
+
+from capture_samples import capture_samples
+from constants import FRAME_ACTIONS_PATH, MIN_LENGTH_FRAMES, MODEL_FRAMES, MODEL_PATH
+from constants import ROOT_PATH, WORDS_JSON_PATH, words_text
+from evaluate_model import normalize_keypoints
+from helpers import draw_keypoints, extract_keypoints, get_word_ids, mediapipe_detection, there_hand
+from training_model import training_model
+from text_to_speech import text_to_speech
+
+
+class ActionWorker(QObject):
+    frame_ready = pyqtSignal(object)
+    status_changed = pyqtSignal(str)
+    finished = pyqtSignal(str)
+    failed = pyqtSignal(str)
+
+    def __init__(self, action, **kwargs):
+        super().__init__()
+        self.action = action
+        self.kwargs = kwargs
+        self.stop_event = threading.Event()
+
+    def run(self):
+        try:
+            if self.action == 'capture':
+                capture_samples(
+                    self.kwargs['path'],
+                    camera_index=self.kwargs['camera_index'],
+                    stop_event=self.stop_event,
+                    frame_callback=self._capture_frame,
+                    status_callback=self.status_changed.emit,
+                )
+                self.finished.emit('Captura finalizada.')
+            else:
+                self.status_changed.emit('Entrenando modelo...')
+                training_model(MODEL_PATH, epochs=self.kwargs['epochs'])
+                self.finished.emit('Entrenamiento finalizado.')
+        except Exception as error:
+            self.failed.emit(str(error))
+
+    def _capture_frame(self, image, results):
+        draw_keypoints(image, results)
+        self.frame_ready.emit(image.copy())
+
+
+class LsmLauncher(QMainWindow):
+    def __init__(self):
+        super().__init__()
+        self.setWindowTitle('LSM - Lanzador')
+        self.resize(860, 600)
+        self.capture = None
+        self.holistic_model = None
+        self.model = None
+        self.kp_seq = []
+        self.sentence = []
+        self.count_frame = 0
+        self.fix_frames = 0
+        self.recording = False
+        self.worker_thread = None
+        self.worker = None
+        self._build_ui()
+        self.refresh_cameras()
+
+    def _build_ui(self):
+        central = QWidget()
+        self.setCentralWidget(central)
+        layout = QVBoxLayout(central)
+        layout.setContentsMargins(18, 14, 18, 14)
+        layout.setSpacing(12)
+
+        title = QLabel('Prototipo Interfaz')
+        title.setStyleSheet('font-size: 24px; font-weight: 700;')
+        layout.addWidget(title)
+        subtitle = QLabel('Lanza la captura, el entrenamiento o el reconocimiento de palabras LSM desde una sola ventana.')
+        layout.addWidget(subtitle)
+
+        camera_box = QGroupBox('Cámara')
+        camera_layout = QHBoxLayout(camera_box)
+        camera_layout.addWidget(QLabel('Dispositivo:'))
+        self.camera_combo = QComboBox()
+        self.camera_combo.setMinimumWidth(165)
+        camera_layout.addWidget(self.camera_combo)
+        self.scan_button = QPushButton('Buscar cámaras')
+        self.scan_button.clicked.connect(self.refresh_cameras)
+        camera_layout.addWidget(self.scan_button)
+        self.camera_count = QLabel()
+        camera_layout.addWidget(self.camera_count)
+        camera_layout.addStretch()
+        layout.addWidget(camera_box)
+
+        actions_box = QGroupBox('Acciones')
+        actions_layout = QVBoxLayout(actions_box)
+        buttons_layout = QHBoxLayout()
+        self.capture_button = QPushButton('Capturar secuencias')
+        self.capture_button.clicked.connect(self.start_capture)
+        self.train_button = QPushButton('Entrenar modelo LSTM')
+        self.train_button.clicked.connect(self.start_training)
+        self.live_button = QPushButton('Reconocer en vivo')
+        self.live_button.clicked.connect(self.toggle_live)
+        for button in (self.capture_button, self.train_button, self.live_button):
+            button.setMinimumHeight(40)
+            buttons_layout.addWidget(button)
+        actions_layout.addLayout(buttons_layout)
+        utility_layout = QHBoxLayout()
+        self.stop_button = QPushButton('Detener proceso activo')
+        self.stop_button.setEnabled(False)
+        self.stop_button.clicked.connect(self.stop_process)
+        utility_layout.addWidget(self.stop_button)
+        self.open_data_button = QPushButton('Abrir carpeta MP_Data')
+        self.open_data_button.clicked.connect(self.open_data_folder)
+        utility_layout.addWidget(self.open_data_button)
+        utility_layout.addStretch()
+        actions_layout.addLayout(utility_layout)
+        self.status_label = QLabel('Listo.')
+        actions_layout.addWidget(self.status_label)
+        layout.addWidget(actions_box)
+
+        state_box = QGroupBox('Estado')
+        state_layout = QVBoxLayout(state_box)
+        current_layout = QHBoxLayout()
+        current_layout.addWidget(QLabel('Tarea actual:'))
+        self.task_value = QLabel('Ninguna')
+        current_layout.addWidget(self.task_value)
+        current_layout.addStretch()
+        state_layout.addLayout(current_layout)
+        project_layout = QHBoxLayout()
+        project_layout.addWidget(QLabel('Proyecto:'))
+        project_layout.addWidget(QLabel(ROOT_PATH))
+        project_layout.addStretch()
+        state_layout.addLayout(project_layout)
+        layout.addWidget(state_box)
+
+        output_box = QGroupBox('Salida')
+        output_layout = QVBoxLayout(output_box)
+        self.video_label = QLabel('Vista de cámara inactiva')
+        self.video_label.setAlignment(Qt.AlignCenter)
+        self.video_label.setMinimumHeight(120)
+        self.video_label.setStyleSheet('background: #20252b; color: #c7ced6;')
+        output_layout.addWidget(self.video_label)
+        self.output = QPlainTextEdit()
+        self.output.setReadOnly(True)
+        self.output.setPlainText('Listo. Elige una acción para empezar.')
+        output_layout.addWidget(self.output)
+        layout.addWidget(output_box, 1)
+
+    def refresh_cameras(self):
+        self.camera_combo.clear()
+        found = 0
+        for camera_index in range(5):
+            camera = cv2.VideoCapture(camera_index)
+            if camera.isOpened():
+                self.camera_combo.addItem(f'Cámara {camera_index + 1}', camera_index)
+                found += 1
+            camera.release()
+        self.camera_count.setText(f'{found} encontrada(s)')
+
+    def selected_camera(self):
+        return self.camera_combo.currentData() if self.camera_combo.count() else 0
+
+    def start_capture(self):
+        if self.worker_thread:
+            return
+        word, accepted = QInputDialog.getText(self, 'Nueva secuencia', 'Palabra o frase:')
+        if not accepted or not word.strip():
+            return
+        word_id = word.strip().lower().replace(' ', '_')
+        path = os.path.join(ROOT_PATH, FRAME_ACTIONS_PATH, word_id)
+        self.start_worker('capture', path=path, camera_index=self.selected_camera())
+        self.output.appendPlainText(f'Capturando muestras para: {word_id}')
+
+    def start_training(self):
+        if self.worker_thread:
+            return
+        self.start_worker('training', epochs=500)
+
+    def start_worker(self, action, **kwargs):
+        self.worker_thread = QThread(self)
+        self.worker = ActionWorker(action, **kwargs)
+        self.worker.moveToThread(self.worker_thread)
+        self.worker_thread.started.connect(self.worker.run)
+        self.worker.frame_ready.connect(self.show_frame)
+        self.worker.status_changed.connect(self.set_status)
+        self.worker.finished.connect(self.worker_finished)
+        self.worker.failed.connect(self.worker_failed)
+        self.worker_thread.finished.connect(self.worker.deleteLater)
+        self.worker_thread.start()
+        self.set_busy(True, 'Captura' if action == 'capture' else 'Entrenamiento')
+
+    def worker_finished(self, message):
+        self.set_status(message)
+        self.output.appendPlainText(message)
+        self.finish_worker()
+
+    def worker_failed(self, message):
+        self.set_status('Error.')
+        self.output.appendPlainText(f'Error: {message}')
+        QMessageBox.critical(self, 'Error', message)
+        self.finish_worker()
+
+    def finish_worker(self):
+        if self.worker_thread:
+            self.worker_thread.quit()
+            self.worker_thread.wait()
+        self.worker_thread = None
+        self.worker = None
+        self.set_busy(False, 'Ninguna')
+
+    def stop_process(self):
+        if self.worker:
+            self.worker.stop_event.set()
+        self.stop_live()
+        self.set_status('Proceso detenido.')
+
+    def set_busy(self, busy, task):
+        self.task_value.setText(task)
+        self.stop_button.setEnabled(busy or self.capture is not None)
+        self.capture_button.setEnabled(not busy)
+        self.train_button.setEnabled(not busy)
+        self.live_button.setEnabled(not busy or self.capture is not None)
+
+    def set_status(self, status):
+        self.status_label.setText(status)
+
+    def toggle_live(self):
+        if self.capture is None:
+            self.start_live()
+        else:
+            self.stop_live()
+
+    def start_live(self):
+        if not os.path.exists(MODEL_PATH):
+            QMessageBox.warning(self, 'Modelo no encontrado', f'Entrena primero el modelo en {MODEL_PATH}.')
+            return
+        self.capture = cv2.VideoCapture(self.selected_camera())
+        self.holistic_model = Holistic()
+        self.model = load_model(MODEL_PATH)
+        self.kp_seq, self.sentence = [], []
+        self.count_frame = self.fix_frames = 0
+        self.recording = False
+        self.live_button.setText('Detener reconocimiento')
+        self.set_busy(True, 'Reconocimiento en vivo')
+        self.timer = QTimer(self)
+        self.timer.timeout.connect(self.update_live_frame)
+        self.timer.start(30)
+
+    def update_live_frame(self):
+        ret, frame = self.capture.read()
+        if not ret:
+            return
+        image = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+        results = mediapipe_detection(frame, self.holistic_model)
+        if there_hand(results) or self.recording:
+            self.recording = False
+            self.count_frame += 1
+            if self.count_frame > 1:
+                self.kp_seq.append(extract_keypoints(results))
+        else:
+            if self.count_frame >= MIN_LENGTH_FRAMES + 1:
+                self.fix_frames += 1
+                if self.fix_frames >= 3:
+                    self.kp_seq = self.kp_seq[:-(1 + 3)]
+                    normalized = normalize_keypoints(self.kp_seq, int(MODEL_FRAMES))
+                    result = self.model.predict(np.expand_dims(normalized, axis=0), verbose=0)[0]
+                    if result[np.argmax(result)] > 0.7:
+                        word_id = get_word_ids(WORDS_JSON_PATH)[np.argmax(result)].split('-')[0]
+                        sentence = words_text.get(word_id, word_id.upper())
+                        self.sentence.insert(0, sentence)
+                        self.output.appendPlainText(sentence)
+                        text_to_speech(sentence)
+                    self.fix_frames = self.count_frame = 0
+                    self.kp_seq = []
+            self.recording = False
+        self.show_frame(image, results)
+        self.status_label.setText('Reconociendo...' if self.recording else 'Listo.')
+
+    def show_frame(self, image, results=None):
+        if results is not None:
+            draw_keypoints(image, results)
+        height, width = image.shape[:2]
+        q_image = QImage(image.data, width, height, image.strides[0], QImage.Format_RGB888)
+        self.video_label.setPixmap(QPixmap.fromImage(q_image).scaled(
+            self.video_label.size(), Qt.KeepAspectRatio, Qt.SmoothTransformation))
+
+    def stop_live(self):
+        if self.capture is None:
+            return
+        self.timer.stop()
+        self.capture.release()
+        self.capture = None
+        if self.holistic_model:
+            self.holistic_model.close()
+        self.holistic_model = self.model = None
+        self.live_button.setText('Reconocer en vivo')
+        if not self.worker_thread:
+            self.set_busy(False, 'Ninguna')
+
+    def open_data_folder(self):
+        folder = os.path.join(ROOT_PATH, 'frame_actions')
+        os.makedirs(folder, exist_ok=True)
+        if sys.platform == 'win32':
+            os.startfile(folder)
+        else:
+            QFileDialog.getOpenFileName(self, 'Abrir carpeta MP_Data', folder)
+
+    def closeEvent(self, event):
+        if self.worker:
+            self.worker.stop_event.set()
+        self.stop_live()
+        if self.worker_thread:
+            self.worker_thread.quit()
+            self.worker_thread.wait()
+        event.accept()
+
+
+if __name__ == '__main__':
+    app = QApplication(sys.argv)
+    window = LsmLauncher()
+    window.show()
+    sys.exit(app.exec_())
