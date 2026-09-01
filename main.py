@@ -8,7 +8,7 @@ from mediapipe.python.solutions.holistic import Holistic
 from PyQt5.QtCore import QObject, QThread, Qt, QTimer, pyqtSignal
 from PyQt5.QtGui import QImage, QPixmap
 from PyQt5.QtWidgets import (
-    QApplication, QComboBox, QFileDialog, QGroupBox, QHBoxLayout, QLabel,
+    QApplication, QCheckBox, QComboBox, QFileDialog, QGroupBox, QHBoxLayout, QLabel,
     QMainWindow, QMessageBox, QPushButton, QPlainTextEdit, QVBoxLayout,
     QWidget, QInputDialog,
 )
@@ -73,6 +73,10 @@ class LsmLauncher(QMainWindow):
         self.recording = False
         self.worker_thread = None
         self.worker = None
+        # Preview attributes
+        self.preview_capture = None
+        self.preview_timer = None
+        self.preview_enabled = False
         self._build_ui()
         self.refresh_cameras()
 
@@ -94,12 +98,17 @@ class LsmLauncher(QMainWindow):
         camera_layout.addWidget(QLabel('Dispositivo:'))
         self.camera_combo = QComboBox()
         self.camera_combo.setMinimumWidth(165)
+        self.camera_combo.currentIndexChanged.connect(self.on_camera_selected)
         camera_layout.addWidget(self.camera_combo)
         self.scan_button = QPushButton('Buscar cámaras')
         self.scan_button.clicked.connect(self.refresh_cameras)
         camera_layout.addWidget(self.scan_button)
         self.camera_count = QLabel()
         camera_layout.addWidget(self.camera_count)
+        # Agregar checkbox para preview
+        self.preview_checkbox = QCheckBox('Mostrar preview')
+        self.preview_checkbox.stateChanged.connect(self.on_preview_toggled)
+        camera_layout.addWidget(self.preview_checkbox)
         camera_layout.addStretch()
         layout.addWidget(camera_box)
 
@@ -158,13 +167,87 @@ class LsmLauncher(QMainWindow):
         output_layout.addWidget(self.output)
         layout.addWidget(output_box, 1)
 
+    def on_camera_selected(self):
+        """Se ejecuta cuando cambia la cámara seleccionada"""
+        if self.preview_checkbox.isChecked():
+            self.stop_preview()
+            self.start_preview()
+
+    def on_preview_toggled(self, state):
+        """Se ejecuta cuando se activa/desactiva el checkbox de preview"""
+        if state == Qt.Checked:
+            self.start_preview()
+        else:
+            self.stop_preview()
+
+    def start_preview(self):
+        """Inicia el preview de la cámara seleccionada"""
+        if self.preview_capture is not None:
+            return
+        
+        camera_index = self.selected_camera()
+        self.preview_capture = cv2.VideoCapture(camera_index)
+        
+        if not self.preview_capture.isOpened():
+            QMessageBox.warning(self, 'Error', 'No se pudo abrir la cámara.')
+            self.preview_capture = None
+            return
+        
+        self.preview_enabled = True
+        self.video_label.setText('')
+        self.preview_timer = QTimer(self)
+        self.preview_timer.timeout.connect(self.update_preview_frame)
+        self.preview_timer.start(30)
+        self.set_status('Mostrando preview de cámara...')
+
+    def update_preview_frame(self):
+        """Actualiza el frame del preview"""
+        if self.preview_capture is None:
+            return
+        
+        ret, frame = self.preview_capture.read()
+        if not ret:
+            return
+        
+        # Convertir BGR a RGB para mostrar correctamente
+        image = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+        height, width = image.shape[:2]
+        q_image = QImage(image.data, width, height, image.strides[0], QImage.Format_RGB888)
+        self.video_label.setPixmap(QPixmap.fromImage(q_image).scaled(
+            self.video_label.size(), Qt.KeepAspectRatio, Qt.SmoothTransformation))
+
+    def stop_preview(self):
+        """Detiene el preview de la cámara"""
+        if self.preview_capture is None:
+            return
+        
+        self.preview_enabled = False
+        if self.preview_timer:
+            self.preview_timer.stop()
+            self.preview_timer = None
+        
+        self.preview_capture.release()
+        self.preview_capture = None
+        self.video_label.setText('Vista de cámara inactiva')
+        self.video_label.setStyleSheet('background: #20252b; color: #c7ced6;')
+        self.set_status('Preview detenido.')
+
     def refresh_cameras(self):
+        self.stop_preview()
+        self.preview_checkbox.setChecked(False)
         self.camera_combo.clear()
         found = 0
         for camera_index in range(5):
             camera = cv2.VideoCapture(camera_index)
             if camera.isOpened():
-                self.camera_combo.addItem(f'Cámara {camera_index + 1}', camera_index)
+                # Obtener información de la cámara
+                width = int(camera.get(cv2.CAP_PROP_FRAME_WIDTH))
+                height = int(camera.get(cv2.CAP_PROP_FRAME_HEIGHT))
+                fps = int(camera.get(cv2.CAP_PROP_FPS))
+                
+                # Crear etiqueta descriptiva
+                label = f'Cámara {camera_index + 1} - {width}x{height} @ {fps if fps else "30"} FPS'
+                self.camera_combo.addItem(label, camera_index)
                 found += 1
             camera.release()
         self.camera_count.setText(f'{found} encontrada(s)')
@@ -175,8 +258,15 @@ class LsmLauncher(QMainWindow):
     def start_capture(self):
         if self.worker_thread:
             return
+        # Detener preview cuando inicia captura
+        self.stop_preview()
+        self.preview_checkbox.setEnabled(False)
+        self.camera_combo.setEnabled(False)
+        
         word, accepted = QInputDialog.getText(self, 'Nueva secuencia', 'Palabra o frase:')
         if not accepted or not word.strip():
+            self.preview_checkbox.setEnabled(True)
+            self.camera_combo.setEnabled(True)
             return
         word_id = word.strip().lower().replace(' ', '_')
         path = os.path.join(ROOT_PATH, FRAME_ACTIONS_PATH, word_id)
@@ -219,6 +309,12 @@ class LsmLauncher(QMainWindow):
         self.worker_thread = None
         self.worker = None
         self.set_busy(False, 'Ninguna')
+        # Reactivar controles de cámara
+        self.preview_checkbox.setEnabled(True)
+        self.camera_combo.setEnabled(True)
+        # Reiniciar preview si estaba activado
+        if self.preview_checkbox.isChecked():
+            self.start_preview()
 
     def stop_process(self):
         if self.worker:
@@ -320,6 +416,7 @@ class LsmLauncher(QMainWindow):
     def closeEvent(self, event):
         if self.worker:
             self.worker.stop_event.set()
+        self.stop_preview()
         self.stop_live()
         if self.worker_thread:
             self.worker_thread.quit()
