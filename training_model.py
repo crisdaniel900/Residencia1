@@ -7,10 +7,10 @@ from keras.utils import to_categorical
 from helpers import get_word_ids, get_sequences_and_labels
 from constants import *
 
-def training_model(model_path, epochs=500):
+def training_model(model_path, epochs=500, keypoints_path=KEYPOINTS_PATH):
     word_ids = get_word_ids(WORDS_JSON_PATH ) # ['word1', 'word2', 'word3]
     
-    sequences, labels = get_sequences_and_labels(word_ids)
+    sequences, labels = get_sequences_and_labels(word_ids, keypoints_path)
     
     sequences = pad_sequences(sequences, maxlen=int(MODEL_FRAMES), padding='pre', truncating='post', dtype='float16')
     

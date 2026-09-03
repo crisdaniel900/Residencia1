@@ -100,11 +100,11 @@ def insert_keypoints_sequence(df, n_sample:int, kp_seq):
     return df
 
 # TRAINING MODEL
-def get_sequences_and_labels(words_id):
+def get_sequences_and_labels(words_id, keypoints_path=KEYPOINTS_PATH):
     sequences, labels = [], []
     
     for word_index, word_id in enumerate(words_id):
-        hdf_path = os.path.join(KEYPOINTS_PATH, f"{word_id}.h5")
+        hdf_path = os.path.join(keypoints_path, f"{word_id}.h5")
         data = pd.read_hdf(hdf_path, key='data')
         for _, df_sample in data.groupby('sample'):
             seq_keypoints = [fila['keypoints'] for _, fila in df_sample.iterrows()]

@@ -8,15 +8,18 @@ from mediapipe.python.solutions.holistic import Holistic
 from PyQt5.QtCore import QObject, QThread, Qt, QTimer, pyqtSignal
 from PyQt5.QtGui import QImage, QPixmap
 from PyQt5.QtWidgets import (
-    QApplication, QCheckBox, QComboBox, QFileDialog, QGroupBox, QHBoxLayout, QLabel,
-    QMainWindow, QMessageBox, QPushButton, QPlainTextEdit, QVBoxLayout,
-    QWidget, QInputDialog,
+    QApplication, QCheckBox, QComboBox, QFileDialog, QGroupBox, QHBoxLayout,
+    QLabel, QMainWindow, QMessageBox, QPushButton, QPlainTextEdit,
+    QVBoxLayout, QWidget,
 )
 from keras.models import load_model
 
 from capture_samples import capture_samples
-from constants import FRAME_ACTIONS_PATH, MIN_LENGTH_FRAMES, MODEL_FRAMES, MODEL_PATH
+from constants import (
+    FRAME_ACTIONS_PATH, KEYPOINTS_PATH, MIN_LENGTH_FRAMES, MODEL_FRAMES, MODEL_PATH,
+)
 from constants import ROOT_PATH, WORDS_JSON_PATH, words_text
+from create_keypoints import create_keypoints
 from evaluate_model import normalize_keypoints
 from helpers import draw_keypoints, extract_keypoints, get_word_ids, mediapipe_detection, there_hand
 from training_model import training_model
@@ -48,7 +51,20 @@ class ActionWorker(QObject):
                 self.finished.emit('Captura finalizada.')
             else:
                 self.status_changed.emit('Entrenando modelo...')
-                training_model(MODEL_PATH, epochs=self.kwargs['epochs'])
+                word_ids = get_word_ids(WORDS_JSON_PATH)
+                for word_id in word_ids:
+                    frames_path = os.path.join(self.kwargs['data_path'], word_id)
+                    if not os.path.isdir(frames_path):
+                        raise FileNotFoundError(
+                            f'No se encontró la carpeta de la palabra "{word_id}" en {self.kwargs["data_path"]}.'
+                        )
+                    hdf_path = os.path.join(KEYPOINTS_PATH, f'{word_id}.h5')
+                    create_keypoints(word_id, self.kwargs['data_path'], hdf_path)
+                training_model(
+                    MODEL_PATH,
+                    epochs=self.kwargs['epochs'],
+                    keypoints_path=KEYPOINTS_PATH,
+                )
                 self.finished.emit('Entrenamiento finalizado.')
         except Exception as error:
             self.failed.emit(str(error))
@@ -77,6 +93,7 @@ class LsmLauncher(QMainWindow):
         self.preview_capture = None
         self.preview_timer = None
         self.preview_enabled = False
+        self.data_path = FRAME_ACTIONS_PATH
         self._build_ui()
         self.refresh_cameras()
 
@@ -133,8 +150,13 @@ class LsmLauncher(QMainWindow):
         self.open_data_button = QPushButton('Abrir carpeta MP_Data')
         self.open_data_button.clicked.connect(self.open_data_folder)
         utility_layout.addWidget(self.open_data_button)
+        self.select_data_button = QPushButton('Seleccionar carpeta MP_Data')
+        self.select_data_button.clicked.connect(self.select_data_folder)
+        utility_layout.addWidget(self.select_data_button)
         utility_layout.addStretch()
         actions_layout.addLayout(utility_layout)
+        self.data_path_label = QLabel(f'Datos: {self.data_path}')
+        actions_layout.addWidget(self.data_path_label)
         self.status_label = QLabel('Listo.')
         actions_layout.addWidget(self.status_label)
         layout.addWidget(actions_box)
@@ -269,14 +291,14 @@ class LsmLauncher(QMainWindow):
             self.camera_combo.setEnabled(True)
             return
         word_id = word.strip().lower().replace(' ', '_')
-        path = os.path.join(ROOT_PATH, FRAME_ACTIONS_PATH, word_id)
+        path = os.path.join(self.data_path, word_id)
         self.start_worker('capture', path=path, camera_index=self.selected_camera())
         self.output.appendPlainText(f'Capturando muestras para: {word_id}')
 
     def start_training(self):
         if self.worker_thread:
             return
-        self.start_worker('training', epochs=500)
+        self.start_worker('training', epochs=500, data_path=self.data_path)
 
     def start_worker(self, action, **kwargs):
         self.worker_thread = QThread(self)
@@ -406,12 +428,24 @@ class LsmLauncher(QMainWindow):
             self.set_busy(False, 'Ninguna')
 
     def open_data_folder(self):
-        folder = os.path.join(ROOT_PATH, 'frame_actions')
+        folder = self.data_path
         os.makedirs(folder, exist_ok=True)
         if sys.platform == 'win32':
             os.startfile(folder)
         else:
             QFileDialog.getOpenFileName(self, 'Abrir carpeta MP_Data', folder)
+
+    def select_data_folder(self):
+        folder = QFileDialog.getExistingDirectory(
+            self,
+            'Seleccionar carpeta MP_Data',
+            self.data_path,
+        )
+        if not folder:
+            return
+        self.data_path = os.path.normpath(folder)
+        self.data_path_label.setText(f'Datos: {self.data_path}')
+        self.set_status('Carpeta MP_Data actualizada.')
 
     def closeEvent(self, event):
         if self.worker:
