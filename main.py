@@ -9,7 +9,7 @@ from PyQt5.QtCore import QObject, QThread, Qt, QTimer, pyqtSignal
 from PyQt5.QtGui import QImage, QPixmap
 from PyQt5.QtWidgets import (
     QApplication, QCheckBox, QComboBox, QFileDialog, QGroupBox, QHBoxLayout,
-    QLabel, QMainWindow, QMessageBox, QPushButton, QPlainTextEdit,
+    QInputDialog, QLabel, QMainWindow, QMessageBox, QPushButton, QPlainTextEdit,
     QVBoxLayout, QWidget,
 )
 from keras.models import load_model
@@ -21,9 +21,11 @@ from constants import (
 from constants import ROOT_PATH, WORDS_JSON_PATH, words_text
 from create_keypoints import create_keypoints
 from evaluate_model import normalize_keypoints
-from helpers import draw_keypoints, extract_keypoints, get_word_ids, mediapipe_detection, there_hand
+from helpers import (
+    draw_keypoints, extract_keypoints, get_available_word_ids, get_word_ids,
+    mediapipe_detection, there_hand,
+)
 from training_model import training_model
-from text_to_speech import text_to_speech
 
 
 class ActionWorker(QObject):
@@ -51,19 +53,20 @@ class ActionWorker(QObject):
                 self.finished.emit('Captura finalizada.')
             else:
                 self.status_changed.emit('Entrenando modelo...')
-                word_ids = get_word_ids(WORDS_JSON_PATH)
+                word_ids = get_available_word_ids(self.kwargs['data_path'])
+                if not word_ids:
+                    raise FileNotFoundError(
+                        f'No hay carpetas de palabras con muestras en {self.kwargs["data_path"]}.'
+                    )
                 for word_id in word_ids:
                     frames_path = os.path.join(self.kwargs['data_path'], word_id)
-                    if not os.path.isdir(frames_path):
-                        raise FileNotFoundError(
-                            f'No se encontró la carpeta de la palabra "{word_id}" en {self.kwargs["data_path"]}.'
-                        )
-                    hdf_path = os.path.join(KEYPOINTS_PATH, f'{word_id}.h5')
+                    hdf_path = os.path.join(self.kwargs['keypoints_path'], f'{word_id}.h5')
                     create_keypoints(word_id, self.kwargs['data_path'], hdf_path)
                 training_model(
                     MODEL_PATH,
                     epochs=self.kwargs['epochs'],
-                    keypoints_path=KEYPOINTS_PATH,
+                    keypoints_path=self.kwargs['keypoints_path'],
+                    word_ids=word_ids,
                 )
                 self.finished.emit('Entrenamiento finalizado.')
         except Exception as error:
@@ -87,6 +90,8 @@ class LsmLauncher(QMainWindow):
         self.count_frame = 0
         self.fix_frames = 0
         self.recording = False
+        self.last_detected_word = None
+        self.detection_cooldown = 0
         self.worker_thread = None
         self.worker = None
         # Preview attributes
@@ -94,6 +99,7 @@ class LsmLauncher(QMainWindow):
         self.preview_timer = None
         self.preview_enabled = False
         self.data_path = FRAME_ACTIONS_PATH
+        self.keypoints_path = KEYPOINTS_PATH
         self._build_ui()
         self.refresh_cameras()
 
@@ -153,10 +159,18 @@ class LsmLauncher(QMainWindow):
         self.select_data_button = QPushButton('Seleccionar carpeta MP_Data')
         self.select_data_button.clicked.connect(self.select_data_folder)
         utility_layout.addWidget(self.select_data_button)
+        self.open_keypoints_button = QPushButton('Abrir carpeta KeyPoints')
+        self.open_keypoints_button.clicked.connect(self.open_keypoints_folder)
+        utility_layout.addWidget(self.open_keypoints_button)
+        self.select_keypoints_button = QPushButton('Seleccionar carpeta KeyPoints')
+        self.select_keypoints_button.clicked.connect(self.select_keypoints_folder)
+        utility_layout.addWidget(self.select_keypoints_button)
         utility_layout.addStretch()
         actions_layout.addLayout(utility_layout)
         self.data_path_label = QLabel(f'Datos: {self.data_path}')
         actions_layout.addWidget(self.data_path_label)
+        self.keypoints_path_label = QLabel(f'KeyPoints: {self.keypoints_path}')
+        actions_layout.addWidget(self.keypoints_path_label)
         self.status_label = QLabel('Listo.')
         actions_layout.addWidget(self.status_label)
         layout.addWidget(actions_box)
@@ -178,6 +192,12 @@ class LsmLauncher(QMainWindow):
 
         output_box = QGroupBox('Salida')
         output_layout = QVBoxLayout(output_box)
+        self.detected_label = QLabel('Detectado: ---')
+        self.detected_label.setAlignment(Qt.AlignCenter)
+        self.detected_label.setStyleSheet(
+            'font-size: 28px; font-weight: 700; color: #1769aa; padding: 10px;'
+        )
+        output_layout.addWidget(self.detected_label)
         self.video_label = QLabel('Vista de cámara inactiva')
         self.video_label.setAlignment(Qt.AlignCenter)
         self.video_label.setMinimumHeight(120)
@@ -298,7 +318,13 @@ class LsmLauncher(QMainWindow):
     def start_training(self):
         if self.worker_thread:
             return
-        self.start_worker('training', epochs=500, data_path=self.data_path)
+        os.makedirs(self.keypoints_path, exist_ok=True)
+        self.start_worker(
+            'training',
+            epochs=500,
+            data_path=self.data_path,
+            keypoints_path=self.keypoints_path,
+        )
 
     def start_worker(self, action, **kwargs):
         self.worker_thread = QThread(self)
@@ -370,6 +396,8 @@ class LsmLauncher(QMainWindow):
         self.kp_seq, self.sentence = [], []
         self.count_frame = self.fix_frames = 0
         self.recording = False
+        self.last_detected_word = None
+        self.detection_cooldown = 0
         self.live_button.setText('Detener reconocimiento')
         self.set_busy(True, 'Reconocimiento en vivo')
         self.timer = QTimer(self)
@@ -382,27 +410,35 @@ class LsmLauncher(QMainWindow):
             return
         image = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
         results = mediapipe_detection(frame, self.holistic_model)
-        if there_hand(results) or self.recording:
-            self.recording = False
+        if there_hand(results):
             self.count_frame += 1
-            if self.count_frame > 1:
-                self.kp_seq.append(extract_keypoints(results))
-        else:
-            if self.count_frame >= MIN_LENGTH_FRAMES + 1:
-                self.fix_frames += 1
-                if self.fix_frames >= 3:
-                    self.kp_seq = self.kp_seq[:-(1 + 3)]
-                    normalized = normalize_keypoints(self.kp_seq, int(MODEL_FRAMES))
-                    result = self.model.predict(np.expand_dims(normalized, axis=0), verbose=0)[0]
-                    if result[np.argmax(result)] > 0.7:
-                        word_id = get_word_ids(WORDS_JSON_PATH)[np.argmax(result)].split('-')[0]
-                        sentence = words_text.get(word_id, word_id.upper())
+            self.kp_seq.append(extract_keypoints(results))
+            if self.detection_cooldown > 0:
+                self.detection_cooldown -= 1
+
+            if len(self.kp_seq) >= MODEL_FRAMES and self.detection_cooldown == 0:
+                normalized = normalize_keypoints(self.kp_seq[-MODEL_FRAMES:], int(MODEL_FRAMES))
+                result = self.model.predict(np.expand_dims(normalized, axis=0), verbose=0)[0]
+                predicted_index = int(np.argmax(result))
+                confidence = float(result[predicted_index])
+                word_ids = get_available_word_ids(self.data_path)
+                if predicted_index < len(word_ids):
+                    word_id = word_ids[predicted_index].split('-')[0]
+                    sentence = words_text.get(word_id, word_id.upper())
+                    self.detected_label.setText(
+                        f'Predicción: {sentence} ({confidence * 100:.1f}%)'
+                    )
+                    if confidence >= 0.5 and word_id != self.last_detected_word:
+                        self.last_detected_word = word_id
                         self.sentence.insert(0, sentence)
                         self.output.appendPlainText(sentence)
-                        text_to_speech(sentence)
-                    self.fix_frames = self.count_frame = 0
-                    self.kp_seq = []
-            self.recording = False
+                        self.detection_cooldown = MODEL_FRAMES
+                        self.kp_seq = []
+        else:
+            self.kp_seq = []
+            self.count_frame = 0
+            self.detection_cooldown = 0
+            self.last_detected_word = None
         self.show_frame(image, results)
         self.status_label.setText('Reconociendo...' if self.recording else 'Listo.')
 
@@ -435,6 +471,14 @@ class LsmLauncher(QMainWindow):
         else:
             QFileDialog.getOpenFileName(self, 'Abrir carpeta MP_Data', folder)
 
+    def open_keypoints_folder(self):
+        folder = self.keypoints_path
+        os.makedirs(folder, exist_ok=True)
+        if sys.platform == 'win32':
+            os.startfile(folder)
+        else:
+            QFileDialog.getOpenFileName(self, 'Abrir carpeta KeyPoints', folder)
+
     def select_data_folder(self):
         folder = QFileDialog.getExistingDirectory(
             self,
@@ -446,6 +490,19 @@ class LsmLauncher(QMainWindow):
         self.data_path = os.path.normpath(folder)
         self.data_path_label.setText(f'Datos: {self.data_path}')
         self.set_status('Carpeta MP_Data actualizada.')
+
+    def select_keypoints_folder(self):
+        folder = QFileDialog.getExistingDirectory(
+            self,
+            'Seleccionar carpeta KeyPoints',
+            self.keypoints_path,
+        )
+        if not folder:
+            return
+        self.keypoints_path = os.path.normpath(folder)
+        os.makedirs(self.keypoints_path, exist_ok=True)
+        self.keypoints_path_label.setText(f'KeyPoints: {self.keypoints_path}')
+        self.set_status('Carpeta KeyPoints actualizada.')
 
     def closeEvent(self, event):
         if self.worker:

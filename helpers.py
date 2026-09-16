@@ -31,6 +31,14 @@ def get_word_ids(path):
         data = json.load(json_file)
         return data.get('word_ids')
 
+def get_available_word_ids(data_path):
+    if not os.path.isdir(data_path):
+        return []
+    return sorted(
+        word_id for word_id in os.listdir(data_path)
+        if os.path.isdir(os.path.join(data_path, word_id))
+    )
+
 # CAPTURE SAMPLES
 def draw_keypoints(image, results):
     '''
